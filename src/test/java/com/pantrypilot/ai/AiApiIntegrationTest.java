@@ -66,6 +66,24 @@ class AiApiIntegrationTest {
         throw new AssertionError("job " + id + " did not finish");
     }
 
+    /** The core module only shows and applies proposals to members, so each test gets a real household. */
+    private record Kitchen(long householdId, long userId) {
+    }
+
+    private Kitchen kitchen() throws Exception {
+        long userId = json(post("/api/core/users").contentType(MediaType.APPLICATION_JSON)
+                .content("{\"displayName\":\"Tester\",\"email\":\"tester" + System.nanoTime() + "@example.com\"}"), 201)
+                .path("id").asLong();
+        long householdId = json(post("/api/core/households").param("userId", String.valueOf(userId))
+                .contentType(MediaType.APPLICATION_JSON).content("{\"name\":\"Test kitchen\"}"), 201)
+                .path("id").asLong();
+        return new Kitchen(householdId, userId);
+    }
+
+    private static MockHttpServletRequestBuilder as(MockHttpServletRequestBuilder request, Kitchen k) {
+        return request.param("householdId", String.valueOf(k.householdId())).param("userId", String.valueOf(k.userId()));
+    }
+
     private static MockMultipartFile image(String field) {
         return new MockMultipartFile(field, "photo.png", "image/png", TestImages.blankPng());
     }
@@ -77,8 +95,8 @@ class AiApiIntegrationTest {
                 {"store":"Fresh Mart","purchaseDate":"2026-11-10","lines":[
                   {"rawText":"GV WHL MLK GAL","name":"whole milk","quantity":1,"unit":"gal","lineTotal":4.29,"confidence":0.9}]}""");
 
-        JsonNode accepted = json(multipart("/api/ai/receipts").file(image("image"))
-                .param("householdId", "21").param("userId", "5"), 202);
+        Kitchen k = kitchen();
+        JsonNode accepted = json(as(multipart("/api/ai/receipts").file(image("image")), k), 202);
         JsonNode job = awaitJob(accepted);
 
         assertThat(job.path("status").asText()).isEqualTo("SUCCEEDED");
@@ -86,24 +104,31 @@ class AiApiIntegrationTest {
         JsonNode proposal = job.path("result").path("proposal");
         assertThat(proposal.path("source").asText()).isEqualTo("RECEIPT");
         assertThat(proposal.path("direction").asText()).isEqualTo("IN");
-        assertThat(proposal.path("householdId").asLong()).isEqualTo(21);
-        assertThat(proposal.path("createdBy").asLong()).isEqualTo(5);
+        assertThat(proposal.path("householdId").asLong()).isEqualTo(k.householdId());
+        assertThat(proposal.path("createdBy").asLong()).isEqualTo(k.userId());
         assertThat(proposal.path("lines").get(0).path("unit").asText()).isEqualTo("ML");
         assertThat(job.path("result").path("details").get(0).path("canonicalName").asText()).isEqualTo("milk");
         assertThat(job.path("result").path("meta").path("store").asText()).isEqualTo("Fresh Mart");
 
         // the proposal waits in the core module's queue; nothing was applied
         long pendingId = job.path("pendingChangeId").asLong();
-        JsonNode queue = json(get("/api/stub/pending").param("householdId", "21"), 200);
+        JsonNode queue = json(as(get("/api/core/pending"), k), 200);
         assertThat(queue).hasSize(1);
         assertThat(queue.get(0).path("id").asLong()).isEqualTo(pendingId);
         assertThat(queue.get(0).path("state").asText()).isEqualTo("PENDING");
 
-        mvc.perform(post("/api/stub/pending/" + pendingId + "/confirm"))
-                .andExpect(status().isOk()).andExpect(jsonPath("$.state").value("CONFIRMED"));
-        mvc.perform(post("/api/stub/pending/" + pendingId + "/reject")).andExpect(status().isConflict());
+        String user = String.valueOf(k.userId());
+        mvc.perform(post("/api/core/pending/" + pendingId + "/confirm").param("userId", user))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.pending.state").value("CONFIRMED"));
+        mvc.perform(post("/api/core/pending/" + pendingId + "/reject").param("userId", user))
+                .andExpect(status().isConflict());
 
-        assertThat(json(get("/api/ai/jobs").param("householdId", "21"), 200)).hasSize(1);
+        // confirming is what puts the milk in the pantry
+        JsonNode pantry = json(get("/api/core/households/" + k.householdId() + "/pantry").param("userId", user), 200);
+        assertThat(pantry).hasSize(1);
+        assertThat(pantry.get(0).path("name").asText()).isEqualTo("milk");
+
+        assertThat(json(get("/api/ai/jobs").param("householdId", String.valueOf(k.householdId())), 200)).hasSize(1);
     }
 
     @Test
@@ -128,8 +153,10 @@ class AiApiIntegrationTest {
                 {"@type":"Recipe","name":"Dal","recipeYield":"4","recipeIngredient":["200 g red lentils","1 onion"]}
                 </script></head><body></body></html>""");
 
+        Kitchen k = kitchen();
         JsonNode job = awaitJob(json(post("/api/ai/recipe-links").contentType(MediaType.APPLICATION_JSON).content("""
-                {"url":"https://recipes.example/dal","servingsMade":2,"householdId":23,"userId":5}"""), 202));
+                {"url":"https://recipes.example/dal","servingsMade":2,"householdId":%d,"userId":%d}"""
+                .formatted(k.householdId(), k.userId())), 202));
 
         assertThat(job.path("status").asText()).isEqualTo("SUCCEEDED");
         JsonNode proposal = job.path("result").path("proposal");
@@ -137,18 +164,20 @@ class AiApiIntegrationTest {
         assertThat(proposal.path("dishName").asText()).isEqualTo("Dal");
         assertThat(proposal.path("servings").asInt()).isEqualTo(2);
         assertThat(proposal.path("lines").get(0).path("quantity").asInt()).isEqualTo(100);
-        assertThat(json(get("/api/stub/pending").param("householdId", "23"), 200)).hasSize(1);
+        assertThat(json(as(get("/api/core/pending"), k), 200)).hasSize(1);
     }
 
     @Test
     void aLinkThatCannotBeReadFailsTheJobWithAMessageAndQueuesNothing() throws Exception {
+        Kitchen k = kitchen();
         JsonNode job = awaitJob(json(post("/api/ai/recipe-links").contentType(MediaType.APPLICATION_JSON).content("""
-                {"url":"https://recipes.example/gone","householdId":24,"userId":5}"""), 202));
+                {"url":"https://recipes.example/gone","householdId":%d,"userId":%d}"""
+                .formatted(k.householdId(), k.userId())), 202));
 
         assertThat(job.path("status").asText()).isEqualTo("FAILED");
         assertThat(job.path("error").asText()).contains("could not be reached");
         assertThat(job.path("pendingChangeId").isNull()).isTrue();
-        assertThat(json(get("/api/stub/pending").param("householdId", "24"), 200)).isEmpty();
+        assertThat(json(as(get("/api/core/pending"), k), 200)).isEmpty();
     }
 
     @Test

@@ -7,7 +7,7 @@ import com.pantrypilot.ai.internal.AiProcessingException;
 import com.pantrypilot.ai.internal.LineDetail;
 import com.pantrypilot.ai.internal.ProposalResult;
 import com.pantrypilot.ai.testsupport.FakeAiBackends;
-import com.pantrypilot.core.stub.StubPendingChanges;
+import com.pantrypilot.core.internal.pending.PendingChangeQueue;
 import com.pantrypilot.shared.Direction;
 import com.pantrypilot.shared.ProposedChange;
 import com.pantrypilot.shared.ProposedLine;
@@ -41,7 +41,7 @@ class AiJobServiceTest {
     @Autowired
     private JobStore store;
     @Autowired
-    private StubPendingChanges pending;
+    private PendingChangeQueue pending;
 
     private static ProposalResult proposal(long householdId, int lines) {
         List<ProposedLine> proposed = new ArrayList<>();

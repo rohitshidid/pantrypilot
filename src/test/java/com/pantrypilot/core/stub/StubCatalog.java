@@ -12,14 +12,12 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
-import org.springframework.stereotype.Service;
 
 /**
- * PLACEHOLDER for Prachiti's catalog and unit model: about forty hard-coded
- * ingredients with a few aliases, average weights and densities. The real one
- * is seeded from USDA FoodData Central and does proper fuzzy matching.
+ * The old in-memory placeholder catalog, kept only as a test helper: the AI
+ * module's unit tests build it with {@code new StubCatalog()} so they need no
+ * database. The server itself uses the real {@code IngredientCatalog}.
  */
-@Service
 public class StubCatalog implements CatalogService, QuantityService {
 
     /**

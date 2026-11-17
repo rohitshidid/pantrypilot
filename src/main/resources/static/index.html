@@ -18,6 +18,7 @@
   label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 4px; }
   input[type=text], input[type=number], input[type=url] { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; }
   input[type=file] { width: 100%; font: inherit; }
+  select { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; background: #fff; }
   button { margin-top: 12px; padding: 8px 14px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
   button.secondary { background: #e7ebe9; color: var(--ink); margin-top: 0; }
   button:disabled { opacity: .5; cursor: default; }
@@ -98,8 +99,28 @@
   </section>
 
   <section>
-    <div class="card-head"><h2>Review queue (core module placeholder)</h2><button class="secondary" id="refreshPending">Refresh</button></div>
+    <div class="card-head"><h2>Review queue</h2><button class="secondary" id="refreshPending">Refresh</button></div>
     <div id="pending" class="muted">Empty.</div>
+  </section>
+
+  <section>
+    <div class="card-head"><h2>Pantry</h2><button class="secondary" id="refreshPantry">Refresh</button></div>
+    <div class="row">
+      <div><label for="addName">Add by hand</label><input id="addName" type="text" placeholder="tomatoes"></div>
+      <div><label for="addQty">Amount</label><input id="addQty" type="number" min="0" step="any" value="1"></div>
+      <div><label for="addUnit">Unit</label><select id="addUnit"><option>COUNT</option><option>G</option><option>ML</option></select></div>
+    </div>
+    <div class="row">
+      <button id="addBtn">Add to pantry</button>
+      <button id="useBtn" class="secondary" style="margin-top:12px">Use this much</button>
+    </div>
+    <div id="pantryMsg" class="error"></div>
+    <div id="pantry" class="muted" style="margin-top:12px">Empty.</div>
+  </section>
+
+  <section>
+    <div class="card-head"><h2>History (audit log)</h2></div>
+    <div id="history" class="muted">Nothing yet.</div>
   </section>
 </main>
 
@@ -286,7 +307,7 @@ $('priceBtn').onclick = async e => {
 async function loadPending() {
   const box = $('pending');
   try {
-    const list = await api('/api/stub/pending?householdId=' + who().householdId);
+    const list = await api('/api/core/pending?householdId=' + who().householdId + '&userId=' + who().userId);
     box.replaceChildren();
     box.className = list.length ? '' : 'muted';
     if (!list.length) { box.textContent = 'Empty.'; return; }
@@ -305,7 +326,8 @@ async function loadPending() {
         actions.append(ok, no);
         head.append(actions);
       }
-      card.append(head, linesTable(c, null));
+      const names = (p.lineNames || []).map((n, i) => ({ canonicalName: n, detectedName: c.lines[i].rawText, note: null }));
+      card.append(head, linesTable(c, names.length ? names : null));
       box.append(card);
     });
   } catch (e) {
@@ -314,14 +336,81 @@ async function loadPending() {
   }
 }
 async function decide(id, action) {
-  try { await api('/api/stub/pending/' + id + '/' + action, { method: 'POST' }); } catch (e) { /* shown on reload */ }
+  try { await api('/api/core/pending/' + id + '/' + action + '?userId=' + who().userId, { method: 'POST' }); }
+  catch (e) { alert(e.message); }
   loadPending();
+  loadPantry();
 }
+// ---- pantry and history (core module) ----
+const home = () => '/api/core/households/' + who().householdId;
+const asUser = () => '?userId=' + who().userId;
+const plain = n => String(Number(n));
+
+async function loadPantry() {
+  const box = $('pantry'), hist = $('history');
+  try {
+    const lots = await api(home() + '/pantry' + asUser());
+    box.replaceChildren();
+    box.className = lots.length ? '' : 'muted';
+    if (!lots.length) box.textContent = 'Empty.';
+    else {
+      const table = el('table'), head = el('tr');
+      ['Item', 'Amount', 'Kept in', 'Expires', ''].forEach(h => head.append(el('th', h)));
+      table.append(head);
+      lots.forEach(lot => {
+        const tr = el('tr');
+        tr.append(el('td', lot.name + (lot.kind === 'LEFTOVER' ? ' (leftover)' : '') + (lot.personal ? ' (private)' : '')));
+        tr.append(el('td', plain(lot.quantity) + UNIT[lot.unit], 'num'));
+        tr.append(el('td', lot.location.toLowerCase()));
+        tr.append(el('td', lot.expiresOn ? lot.expiresOn + ' (' + lot.daysLeft + ' d)' : ''));
+        const td = el('td'), bin = el('button', 'Discard', 'secondary');
+        bin.onclick = () => change(home() + '/lots/' + lot.lotId + '/discard' + asUser(), { reason: 'discarded from the test page' });
+        td.append(bin); tr.append(td);
+        table.append(tr);
+      });
+      const wrap = el('div', null, 'tablewrap'); wrap.append(table); box.append(wrap);
+    }
+    const txns = await api(home() + '/history' + asUser());
+    hist.replaceChildren();
+    hist.className = txns.length ? '' : 'muted';
+    if (!txns.length) { hist.textContent = 'Nothing yet.'; return; }
+    txns.forEach(t => {
+      const line = el('div', null, 'card-head');
+      const what = t.entries.map(e => (Number(e.delta) > 0 ? '+' : '') + plain(e.delta) + UNIT[e.unit] + ' ' + e.name).join(', ');
+      line.append(el('span', '#' + t.id + ' · ' + t.kind + ' · ' + t.userName + (t.dishName ? ' · ' + t.dishName : '') + ' · ' + what
+          + (t.undoneByTxnId ? ' · undone by #' + t.undoneByTxnId : '')));
+      if (t.kind !== 'UNDO' && !t.undoneByTxnId) {
+        const undo = el('button', 'Undo', 'secondary');
+        undo.onclick = () => change(home() + '/changes/' + t.id + '/undo' + asUser(), null);
+        line.append(undo);
+      }
+      hist.append(line);
+    });
+  } catch (e) {
+    box.className = 'error';
+    box.textContent = e.message;
+    hist.replaceChildren();
+  }
+}
+async function change(path, body) {
+  $('pantryMsg').textContent = '';
+  try {
+    await api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  } catch (e) { $('pantryMsg').textContent = e.message; }
+  loadPantry();
+}
+const typedLine = () => ({ name: $('addName').value, quantity: Number($('addQty').value), unit: $('addUnit').value });
+$('addBtn').onclick = () => change(home() + '/stock-in' + asUser(), { lines: [typedLine()] });
+$('useBtn').onclick = () => change(home() + '/consume' + asUser(), { lines: [typedLine()] });
+$('refreshPantry').onclick = loadPantry;
+
 $('refreshPending').onclick = loadPending;
-$('household').onchange = loadPending;
+$('household').onchange = () => { loadPending(); loadPantry(); };
+$('user').onchange = () => { loadPending(); loadPantry(); };
 
 loadStatus();
 loadPending();
+loadPantry();
 </script>
 </body>
 </html>

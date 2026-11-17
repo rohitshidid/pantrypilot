@@ -22,6 +22,9 @@ server:
     include-stacktrace: never
 
 pantrypilot:
+  core:
+    seed-demo: true                    # create "Demo User" and "Demo Household" (both id 1) on an empty database
+    expiry-check-cron: "0 0 8 * * *"   # when to announce items that expire today or in two days
   ai:
     ollama:
       base-url: ${OLLAMA_URL:http://localhost:11434}

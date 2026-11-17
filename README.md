@@ -14,10 +14,10 @@ One Spring Boot server (Java 21) split into three modules, one per team member. 
 |---|---|---|
 | `com.pantrypilot.shared` | all | The team contract: interfaces, `ProposedChange`, events |
 | `com.pantrypilot.ai` | Rohit | **Built**: receipt scan, grocery photos, recipe links, price estimator, threaded job pipeline |
-| `com.pantrypilot.core` | Prachiti | **Placeholder**: in-memory catalog, unit conversion and review queue under `core.stub` |
+| `com.pantrypilot.core` | Prachiti | **Built**: catalog and unit conversion, households and roles, confirmation queue, transactional ledger with audit log and undo, private items, expiry and leftovers |
 | `com.pantrypilot.insights` | Vishvak | **Placeholder**: one endpoint under `insights.stub` showing the money-saved formula |
 
-The placeholders exist so the AI module can run end to end. They are meant to be deleted as the real modules arrive.
+The insights placeholder exists so the other modules can run end to end. It is meant to be deleted when the real module arrives.
 
 ## Run it
 
@@ -53,7 +53,7 @@ The default database is in-memory H2, so data is lost on restart. For PostgreSQL
 ./mvnw test
 ```
 
-120 tests. They need no Ollama, no network and no yt-dlp, because those are replaced by fakes. The OCR tests run the real Tesseract and skip themselves if it is not installed.
+160 tests. They need no Ollama, no network and no yt-dlp, because those are replaced by fakes. The OCR tests run the real Tesseract and skip themselves if it is not installed.
 
 To try the real thing, start the server and use the test page:
 
@@ -62,7 +62,7 @@ To try the real thing, start the server and use the test page:
 3. **Receipt**: upload a photo of a receipt.
 4. **Groceries**: upload one to six photos. A local vision model takes 30 to 60 seconds per photo.
 
-Each result lands in the review queue at the bottom of the page, where it can be confirmed or rejected.
+Each result lands in the review queue, where it can be confirmed or rejected. Confirming applies it to the pantry shown below the queue, and every change appears in the history with an Undo button. The page starts as "Demo User" in "Demo Household" (both id 1), which the server creates on an empty database.
 
 ## AI module API
 
@@ -94,20 +94,66 @@ curl localhost:8090/api/ai/jobs/1
 - **Prices** (`ai.internal.price`): the user's own price, else the cache, else the median of prices found through SearXNG, else the model's estimate.
 - **Safety**: every number from a model is range-checked. Links to private network addresses are refused, on every redirect. Uploads are checked to be real images.
 
+## Core module API
+
+Until login exists, `userId` is a request parameter saying who is asking. Every call checks that user is a member of the household. Errors come back as `{"error": "..."}` with 400, 403, 404 or 409.
+
+| Method and path | Purpose |
+|---|---|
+| `POST /api/core/users` | Register: `displayName`, `email` |
+| `GET /api/core/users/{id}/households` | The households a user belongs to |
+| `POST /api/core/households?userId=` | Create a household (`name`); the creator is its admin |
+| `POST /api/core/households/join?userId=` | Join with an `inviteCode` |
+| `GET /api/core/households/{h}/members?userId=` | Members and roles |
+| `PUT /api/core/households/{h}/members/{memberId}?userId=` | Change a `role` (admin only) |
+| `DELETE /api/core/households/{h}/members/{memberId}?userId=` | Remove a member (admin), or leave |
+| `POST /api/core/households/{h}/invite-code?userId=` | New invite code (admin only) |
+| `GET /api/core/households/{h}/pantry?userId=` | Every lot, soonest expiry first |
+| `GET /api/core/households/{h}/stock?userId=` | One row per ingredient, in count, grams and millilitres |
+| `GET /api/core/households/{h}/expiring?userId=&days=3` | Lots expiring within `days` |
+| `GET /api/core/households/{h}/history?userId=&limit=50` | The audit log |
+| `POST /api/core/households/{h}/stock-in?userId=` | Manual entry: `lines` of `name` or `ingredientId`, `quantity`, `unit`, optional `unitPrice`, `location`, `expiresOn`, `personal` |
+| `POST /api/core/households/{h}/consume?userId=` | Manual use: `lines`, optional `strict`, `dishName`, `servings` |
+| `POST /api/core/households/{h}/lots/{lotId}/discard?userId=` | Throw away: optional `quantity`, `reason` |
+| `POST /api/core/households/{h}/leftovers?userId=` | Save a leftover: `name`, `servings`, optional `location`, `expiresOn`, `personal` |
+| `POST /api/core/households/{h}/changes/{txnId}/undo?userId=` | Undo a change |
+| `GET /api/core/pending?householdId=&userId=` | The review queue |
+| `PUT /api/core/pending/{id}/lines?userId=` | Replace a proposal's lines with corrected ones |
+| `POST /api/core/pending/{id}/confirm?userId=&strict=true` | Apply a proposal |
+| `POST /api/core/pending/{id}/reject?userId=` | Drop a proposal |
+| `GET /api/core/catalog?q=` | Search the catalog |
+| `GET /api/core/catalog/resolve?name=` | Match free text to an ingredient |
+| `GET /api/core/catalog/convert?ingredientId=&quantity=&from=&to=` | Convert between COUNT, G and ML |
+| `POST /api/core/catalog` | Add an ingredient |
+
+## How the core module works
+
+- **Lots and ledger** (`core.internal.inventory`): a lot is one purchase of one ingredient with its own price and expiry. Every amount that moves is one row in an append-only ledger, signed, so the ledger is the audit log and a lot's quantity always equals the sum of its ledger rows.
+- **Atomicity**: `InventoryWriter` is the only class that changes stock, and each of its methods is one `@Transactional` unit. Confirming a proposal (`PendingStore.confirm`) runs the lots, the ledger rows, the cook event and the CONFIRMED state in a single transaction, so a line that fails (not enough stock, not matched) rolls back the whole proposal and leaves it PENDING.
+- **Concurrency**: lots and proposals carry a `@Version` column. A member who writes from a stale read is refused instead of overwriting the other member's change; `ConflictRetry` then runs that whole transaction again on fresh data. A proposal confirmed by several people at once is applied once.
+- **Undo**: a compensating transaction. The original rows stay; a new transaction is appended with the opposite amounts and a pointer to the one it reverses. A unique constraint on that pointer means a change can be undone only once. Stock that has been partly used cannot be un-added until the use is undone.
+- **Deduction order**: soonest expiry first, across the lots the user may use. A recipe in grams can deduct from items stored by count, through the ingredient's average weight or density. `strict=false` uses what is there and reports the shortfall.
+- **Private items**: a lot marked `personal` is visible to and usable by its owner only, so another member's recipe never consumes it.
+- **Expiry and leftovers**: a lot without a date gets one from the ingredient's shelf life in the place it is stored. A leftover is a household-scoped item counted in servings, with 4 days in the fridge or 90 in the freezer. `ExpiryNotifier` publishes `ItemExpiringSoon` daily at 08:00 for lots expiring that day or in two days.
+- **Events**: `InventoryChanged`, `ItemConsumed`, `ItemDiscarded` and `DishCooked` are published only after the transaction has committed, so the insights module never sees a change that was rolled back.
+- **Catalog** (`core.internal.catalog`): 80 ingredients seeded by Flyway with aliases, average weights, densities and shelf lives, held in memory as an immutable snapshot. Matching tries the exact name or alias, the singular, the longest name inside the text, then one or two typos.
+
 ## For teammates: replacing a placeholder
 
 1. Write your implementation of the interface in your own module (for example `CatalogService` in `core`).
-2. Delete the matching class under `core.stub` or `insights.stub`.
+2. Delete the matching class under `insights.stub`.
 3. Run `./mvnw test`. `ModularityTest` checks that modules still only use `shared`.
 
-The AI module uses `CatalogService.resolve` and `PendingChangeService.submit`, and provides `PriceEstimator` and `RecipeExtractor`. In `ProposedLine`, `unitPrice` is the price of one unit: one item, one gram or one millilitre.
+The AI module uses `CatalogService.resolve` and `PendingChangeService.submit`, and provides `PriceEstimator` and `RecipeExtractor`. The core module provides `CatalogService`, `QuantityService`, `PendingChangeService` and `InventoryQuery`, and publishes the events in `shared.events`. `StubCatalog` now lives under `src/test` only, as a database-free catalog for the AI unit tests. In `ProposedLine`, `unitPrice` is the price of one unit: one item, one gram or one millilitre.
 
 ## Not done yet
 
 - Stretch goals: photos while cooking, finished-dish photo with correction memory, Instagram links.
 - Speech-to-text fallback (whisper.cpp) for videos without captions.
 - The Flutter screens for capture and link paste. The test page stands in for them.
-- Login. `householdId` and `userId` are plain request parameters until the core module adds JWT security.
+- Login. `householdId` and `userId` are plain request parameters; Spring Security with JWT is not added yet. The core module checks household membership on every call, but trusts the `userId` it is given.
+- The Flutter pantry and household screens. The test page stands in for them.
+- Undoing a cooked dish restores the stock but does not publish an event, because `shared.events` has none for it; the cook event row stays. The insights module would need one to take the dish back out of money saved.
 - Photo storage (MinIO). Photos are processed in memory and not kept.
 - The labelled evaluation sets and accuracy scripts from the proposal.
 
@@ -115,7 +161,9 @@ Known limits of what is built:
 
 - Receipt scanning has only been tried on computer-drawn receipt images, not on phone photos of paper receipts. Sideways phone photos are not rotated, and HEIC images are not accepted.
 - Web price search has been tested against sample SearXNG answers only, never a running SearXNG.
-- The PostgreSQL profile has not been run.
+- The PostgreSQL profile has not been run, including the core module's migrations (`V2`, `V3`), which have only run on H2 in PostgreSQL mode.
+- The catalog's weights, densities and shelf lives are approximate hand-entered values, not yet imported from USDA FoodData Central and FoodKeeper.
+- `submit` accepts a proposal for any household id; membership is checked when a user reads or decides it.
 - The models are called with `java.net.http.HttpClient` directly rather than through LangChain4j, and it has been run with `gemma4` rather than the Qwen2.5-VL and Llama 3.1 models named in the proposal.
 
 ## Libraries
