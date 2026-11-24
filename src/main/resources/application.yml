@@ -1,4 +1,7 @@
 spring:
+  threads:
+    virtual:
+      enabled: true  # HTTP requests can call the existing Core REST API without exhausting the servlet worker pool.
   application:
     name: pantrypilot
   datasource:
