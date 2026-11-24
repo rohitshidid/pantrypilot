@@ -8,16 +8,16 @@ PantryPilot fills a household's inventory from a receipt scan or a grocery photo
 
 ## What is in this repository
 
-One Spring Boot server (Java 21) split into three modules, one per team member. The modules only talk through the types in `shared`, and a test fails the build if one reaches into another's internals.
+One Spring Boot server (Java 21) split into three modules, one per team member. Java dependencies between modules use the types in `shared`. Insights also reads the public core pantry and history endpoints. A test fails the build if one module imports another's internals.
 
 | Package | Owner | State |
 |---|---|---|
 | `com.pantrypilot.shared` | all | The team contract: interfaces, `ProposedChange`, events |
 | `com.pantrypilot.ai` | Rohit | **Built**: receipt scan, grocery photos, recipe links, price estimator, threaded job pipeline |
 | `com.pantrypilot.core` | Prachiti | **Built**: catalog and unit conversion, households and roles, confirmation queue, transactional ledger with audit log and undo, private items, expiry and leftovers |
-| `com.pantrypilot.insights` | Vishvak | **Placeholder**: one endpoint under `insights.stub` showing the money-saved formula |
+| `com.pantrypilot.insights` | Vishvak | Shared shopping lists, usage and waste analytics, cooking savings, recipe availability and grocery reminders |
 
-The insights placeholder exists so the other modules can run end to end. It is meant to be deleted when the real module arrives.
+The JavaFX desktop client lives in `desktop/` and uses the same REST server as the browser demo.
 
 ## Run it
 
@@ -53,7 +53,7 @@ The default database is in-memory H2, so data is lost on restart. For PostgreSQL
 ./mvnw test
 ```
 
-160 tests. They need no Ollama, no network and no yt-dlp, because those are replaced by fakes. The OCR tests run the real Tesseract and skip themselves if it is not installed.
+The server tests run against H2. Insights integration tests use local HTTP and a Google Calendar fixture. The OCR tests use real Tesseract when its English language data is installed.
 
 To try the real thing, start the server and use the test page:
 
@@ -138,11 +138,43 @@ Until login exists, `userId` is a request parameter saying who is asking. Every 
 - **Events**: `InventoryChanged`, `ItemConsumed`, `ItemDiscarded` and `DishCooked` are published only after the transaction has committed, so the insights module never sees a change that was rolled back.
 - **Catalog** (`core.internal.catalog`): 80 ingredients seeded by Flyway with aliases, average weights, densities and shelf lives, held in memory as an immutable snapshot. Matching tries the exact name or alias, the singular, the longest name inside the text, then one or two typos.
 
-## For teammates: replacing a placeholder
+## Insights and the JavaFX dashboard
 
-1. Write your implementation of the interface in your own module (for example `CatalogService` in `core`).
-2. Delete the matching class under `insights.stub`.
-3. Run `./mvnw test`. `ModularityTest` checks that modules still only use `shared`.
+With Java 21 active, start the server and desktop in separate terminals at the repository root. On Windows use `.\mvnw.cmd` in place of `./mvnw`.
+
+```sh
+./mvnw spring-boot:run
+./mvnw -f desktop/pom.xml javafx:run
+```
+
+The desktop opens Demo Household 1 as Demo User 1. To switch, enter both IDs and click **Load household**. Set `PANTRYPILOT_SERVER` on the desktop to connect to a server other than `http://localhost:8090`. Run the desktop HTTP client test with `./mvnw -f desktop/pom.xml test`.
+
+**Try the shopping loop.** Add four shared tomatoes in the browser. In the desktop shopping tab, set tomato to a minimum of three in `COUNT`. Confirm a recipe that uses two tomatoes, then click **Load household**. The list shows one tomato to buy. Undo the deduction and reload to clear it. Personal lots only contribute to their owner's recipe availability.
+
+Household routes below start at `/api/insights/households/{id}` and require the current member's `userId`.
+
+| Method and suffix | Purpose |
+|---|---|
+| `PUT /thresholds` | Set a household rule, e.g. `{"ingredient":"tomato","unit":"COUNT","minimum":3}`. |
+| `DELETE /thresholds?ingredient=tomato` | Remove that rule. |
+| `GET /shopping-list` | Return each shortfall in the rule's unit. Matching the minimum clears the item. A missing conversion yields a null shortfall to review and leaves that item off the grocery reminder. |
+| `GET /analytics?days=7` | Usage and average per day by ingredient and unit, discarded quantities and known waste cost, meals and savings. Choose 1 to 365 days. |
+| `GET /history` | Recent ledger changes visible to this member. Undone entries identify their reversing transaction. |
+| `GET /cook-now` | Starter recipes the member can cook with the stock they can use. An optional URL-encoded `url` checks a recipe link and returns missing ingredients. |
+| `PUT /calendar` | Opt in and obtain a private iCalendar path. Add `google=true` to enable direct Google Calendar sync for a configured member. |
+| `DELETE /calendar` | Revoke the feed immediately and queue removal of the direct Google reminder. |
+
+**How totals work.** Core's member-checked pantry exposes unit prices and visibility while lots are in stock. Insights retains those facts on committed HTTP inventory changes and dashboard reads. It joins them to the most recent 200 core transactions, excluding reversed changes from totals. The report flags a truncated time window, counts unpriced waste lines and meals, and omits their unknown dollar amounts. A depleted lot from before Insights first saw it can lack price and visibility information. The savings comparison uses the editable restaurant estimate and the original demo's fee multiplier of 1.38875. The single-dish calculator is at `GET /api/insights/money-saved?dish=Soup&servings=2&ingredientCost=4.50`.
+
+### Grocery reminders
+
+In **Shopping list**, choose **Enable calendar feed** for a revocable iCalendar URL. Google Calendar's **Other calendars → From URL** option needs an address Google can reach. Anyone with the private feed URL can read that grocery reminder.
+
+**Sync to Google** writes a grocery-run event to the opted-in member's primary Google Calendar. For local development, enable the Google Calendar API for your OAuth client and obtain an offline refresh token with the member's consent for `https://www.googleapis.com/auth/calendar.events.owned`. On the server, set `PANTRYPILOT_GOOGLE_CLIENT_ID`, `PANTRYPILOT_GOOGLE_CLIENT_SECRET`, and `PANTRYPILOT_GOOGLE_REFRESH_TOKEN_<userId>` for each consenting member. Keep the values outside the repository. Configure persistent PostgreSQL for reminders that must survive restarts. The demo trusts caller-supplied user IDs, so use direct sync with a local test account. [Google OAuth offline access](https://developers.google.com/identity/protocols/oauth2/web-server#offline) · [Calendar event permissions](https://developers.google.com/workspace/calendar/api/v3/reference/events/insert)
+
+The first scheduled check runs one minute after startup and subsequent checks run every 15 minutes by default (`pantrypilot.insights.calendar-refresh`). A low-stock list creates one all-day grocery run. List changes update the existing event. Restocking, opting out or losing membership removes it on a scheduled check. Failed Google writes retry at the next check. You can test the feed and charts locally without Google credentials.
+
+## Module integration
 
 The AI module uses `CatalogService.resolve` and `PendingChangeService.submit`, and provides `PriceEstimator` and `RecipeExtractor`. The core module provides `CatalogService`, `QuantityService`, `PendingChangeService` and `InventoryQuery`, and publishes the events in `shared.events`. `StubCatalog` now lives under `src/test` only, as a database-free catalog for the AI unit tests. In `ProposedLine`, `unitPrice` is the price of one unit: one item, one gram or one millilitre.
 
@@ -153,7 +185,6 @@ The AI module uses `CatalogService.resolve` and `PendingChangeService.submit`, a
 - The Flutter screens for capture and link paste. The test page stands in for them.
 - Login. `householdId` and `userId` are plain request parameters; Spring Security with JWT is not added yet. The core module checks household membership on every call, but trusts the `userId` it is given.
 - The Flutter pantry and household screens. The test page stands in for them.
-- Undoing a cooked dish restores the stock but does not publish an event, because `shared.events` has none for it; the cook event row stays. The insights module would need one to take the dish back out of money saved.
 - Photo storage (MinIO). Photos are processed in memory and not kept.
 - The labelled evaluation sets and accuracy scripts from the proposal.
 
@@ -161,11 +192,11 @@ Known limits of what is built:
 
 - Receipt scanning has only been tried on computer-drawn receipt images, not on phone photos of paper receipts. Sideways phone photos are not rotated, and HEIC images are not accepted.
 - Web price search has been tested against sample SearXNG answers only, never a running SearXNG.
-- The PostgreSQL profile has not been run, including the core module's migrations (`V2`, `V3`), which have only run on H2 in PostgreSQL mode.
+- The Insights integration tests ran on H2 and an isolated PostgreSQL 16 database. All seven Flyway migrations ran on both. Live Google Calendar delivery still needs a check with a consenting account.
 - The catalog's weights, densities and shelf lives are approximate hand-entered values, not yet imported from USDA FoodData Central and FoodKeeper.
 - `submit` accepts a proposal for any household id; membership is checked when a user reads or decides it.
 - The models are called with `java.net.http.HttpClient` directly rather than through LangChain4j, and it has been run with `gemma4` rather than the Qwen2.5-VL and Llama 3.1 models named in the proposal.
 
 ## Libraries
 
-Spring Boot, Spring Data JPA, Spring Modulith, Flyway, H2, PostgreSQL driver, Tess4J (Tesseract), Jsoup, JUnit 5, AssertJ. External tools: Ollama, Tesseract, yt-dlp.
+Spring Boot, Spring Data JPA, Spring JDBC, Spring Modulith, Flyway, H2, PostgreSQL driver, JavaFX, Tess4J (Tesseract), Jsoup, JUnit 5, AssertJ. External tools: Ollama, Tesseract, yt-dlp.
